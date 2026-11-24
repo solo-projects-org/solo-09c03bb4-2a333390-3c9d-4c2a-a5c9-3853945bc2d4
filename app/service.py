@@ -1,13 +1,17 @@
-"""Application services: import, supply, diagnosis and batch resurvey.
+"""Application services: import, supply, diagnosis, catchments and batch resurvey.
 
 Every mutating public method runs inside exactly one ``Store.write_tx`` so the
-direction map, the supply answer and the isolation reasons commit or roll back
-together.  Reads run inside one ``Store.read_tx`` snapshot, so a concurrent
-write can never make the three tables disagree mid-response.
+direction map, the supply answer, the isolation reasons and the catchment
+polygons commit or roll back together.  Reads run inside one ``Store.read_tx``
+snapshot, so a concurrent write can never make the tables disagree
+mid-response.
 """
 
 from __future__ import annotations
 
+import csv
+import hashlib
+import io
 import json
 import sqlite3
 from typing import Iterable, Mapping
@@ -20,6 +24,7 @@ from .grid import (
     parse_token,
     token_for,
 )
+from .polygon import catchment_wkt
 from .store import Store
 
 
@@ -93,6 +98,52 @@ def _state_token(state: tuple[str, str | None]) -> str:
     return token_for(*state)
 
 
+# ---------------------------------------------------------------------------
+# Catchment helpers
+# ---------------------------------------------------------------------------
+def _supplied_sets_from_results(
+    results: Mapping[Cell, FlowResult],
+) -> dict[Cell, set[Cell]]:
+    """Group freshly evaluated results by the outfall they reach.
+
+    The evaluated set can contain outfall cells on import; they are terminals
+    rather than supply cells, so they are excluded here to keep the sets
+    identical to what ``flow_results`` stores for direction cells.
+    """
+    grouped: dict[Cell, set[Cell]] = {}
+    for cell, result in results.items():
+        if result.outcome == "supplied" and result.outfall is not None and cell != result.outfall:
+            grouped.setdefault(result.outfall, set()).add(cell)
+    return grouped
+
+
+def _cell_set_hash(cells: Iterable[Cell]) -> str:
+    """Order- and container-type independent fingerprint of a supply cell set."""
+    digest = hashlib.sha256()
+    for row, col in sorted(cells):
+        digest.update(f"{int(row)},{int(col)}\n".encode())
+    return digest.hexdigest()
+
+
+def _build_catchment_entries(
+    supplied: Mapping[Cell, set[Cell]],
+) -> list[tuple[Cell, int, str, str]]:
+    """Generate WKT for every non-empty supplied set.
+
+    Raises if polygon generation fails for any outfall, so the caller's whole
+    transaction can be rolled back and previous catchments stay queryable.
+    """
+    entries: list[tuple[Cell, int, str, str]] = []
+    for outfall, cells in sorted(supplied.items()):
+        if not cells:
+            continue
+        wkt = catchment_wkt(cells)
+        if not wkt:  # pragma: no cover - guarded by the non-empty check
+            raise RuntimeError(f"empty catchment WKT for outfall {outfall}")
+        entries.append((outfall, len(cells), _cell_set_hash(cells), wkt))
+    return entries
+
+
 class GridService:
     def __init__(self, store: Store):
         self.store = store
@@ -108,9 +159,11 @@ class GridService:
                 "the grid has no outfall ('O') cell, so no supply can be computed"
             )
         results = self._evaluate_map(rows, cols, cells)
+        catchment_entries = _build_catchment_entries(_supplied_sets_from_results(results))
         with self.store.write_tx() as conn:
             grid_id = self.store.insert_grid(rows, cols, source_name, cells)
             self.store.store_results(conn, grid_id, results)
+            self.store.replace_catchments(conn, grid_id, catchment_entries, [])
         supplied = sum(1 for result in results.values() if result.outcome == "supplied")
         missing = sum(1 for kind, _ in cells.values() if kind == "missing")
         outfall_count = len(outfalls)
@@ -413,6 +466,11 @@ class GridService:
                         "before": self._outfall_counts_json(grid_id),
                         "after": self._outfall_counts_json(grid_id),
                     },
+                    "catchment_transition": {
+                        "regenerated": [],
+                        "unchanged": [],
+                        "removed": [],
+                    },
                     "changes": [],
                     "affected_cells": [],
                 }
@@ -444,12 +502,64 @@ class GridService:
             results = evaluate_cells(
                 affected, states, rows, cols, lookup_state, lookup_result
             )
+            new_supplied = _supplied_sets_from_results(results)
+            # An outfall's catchment can change only if one of the re-evaluated
+            # cells is supplied to it (before or after the resurvey).
+            affected_payload = json.dumps([[r, c] for r, c in affected])
+            old_outfalls = {
+                (row["outfall_row"], row["outfall_col"])
+                for row in self.store.conn.execute(
+                    "SELECT DISTINCT f.outfall_row, f.outfall_col "
+                    "FROM flow_results f "
+                    "JOIN json_each(?) AS j "
+                    "  ON f.row = json_extract(j.value, '$[0]') "
+                    " AND f.col = json_extract(j.value, '$[1]') "
+                    "WHERE f.grid_id = ? AND f.outcome = 'supplied'",
+                    (affected_payload, grid_id),
+                )
+            }
+            candidate_outfalls = old_outfalls | set(new_supplied)
             before_counts = self._outfall_counts(grid_id)
             self.store.update_cells(conn, grid_id, after_by_cell)
             self.store.store_results(conn, grid_id, results)
+            # Re-read the full supplied sets: re-evaluated cells now sit in
+            # flow_results next to the unaffected cells whose cached answers
+            # were inherited, so this is the post-resurvey ground truth.
+            current_supplied = self._supplied_sets(grid_id, candidate_outfalls)
+
+            # Re-generate a catchment only when the supply *set* changed.
+            # Equal size with different membership still counts as changed;
+            # outfalls that lost their last cell are dropped from the export.
+            old_hashes = self.store.catchment_hashes(grid_id)
+            entries = []
+            removed: list[Cell] = []
+            regenerated: list[Cell] = []
+            unchanged: list[Cell] = []
+            for outfall in sorted(candidate_outfalls):
+                cells = current_supplied.get(outfall, set())
+                if not cells:
+                    if outfall in old_hashes:
+                        removed.append(outfall)
+                    continue
+                new_hash = _cell_set_hash(cells)
+                if old_hashes.get(outfall) == new_hash:
+                    unchanged.append(outfall)
+                    continue
+                wkt = catchment_wkt(cells)
+                if not wkt:  # pragma: no cover - guarded by the non-empty check
+                    raise RuntimeError(f"empty catchment WKT for outfall {outfall}")
+                entries.append((outfall, len(cells), new_hash, wkt))
+                regenerated.append(outfall)
+            self.store.replace_catchments(conn, grid_id, entries, removed)
+
             resurvey_id = self.store.insert_resurvey(conn, grid_id, changes, len(affected))
             supplied_count = self._supplied_count(grid_id)
             after_counts = self._outfall_counts(grid_id)
+            catchment_transition = {
+                "regenerated": [cell_json(c) for c in regenerated],
+                "unchanged": [cell_json(c) for c in unchanged],
+                "removed": [cell_json(c) for c in removed],
+            }
 
         return {
             "grid_id": grid_id,
@@ -462,6 +572,7 @@ class GridService:
                 "before": _counts_json(before_counts),
                 "after": _counts_json(after_counts),
             },
+            "catchment_transition": catchment_transition,
             "changes": [
                 {
                     "row": cell[0],
@@ -509,6 +620,84 @@ class GridService:
             }
             for cell in sorted(counts)
         ]
+
+    def _supplied_sets(
+        self, grid_id: int, outfalls: Iterable[Cell] | None = None
+    ) -> dict[Cell, set[Cell]]:
+        """Current supplied cells per outfall, read straight from flow_results."""
+        if outfalls is None:
+            rows = self.store.conn.execute(
+                "SELECT row, col, outfall_row, outfall_col FROM flow_results "
+                "WHERE grid_id = ? AND outcome = 'supplied'",
+                (grid_id,),
+            )
+        else:
+            outfalls = list(outfalls)
+            if not outfalls:
+                return {}
+            rows = self.store.conn.execute(
+                "SELECT f.row, f.col, f.outfall_row, f.outfall_col FROM flow_results f "
+                "JOIN json_each(?) AS j "
+                "  ON f.outfall_row = json_extract(j.value, '$[0]') "
+                " AND f.outfall_col = json_extract(j.value, '$[1]') "
+                "WHERE f.grid_id = ? AND f.outcome = 'supplied'",
+                (json.dumps([[r, c] for r, c in outfalls]), grid_id),
+            )
+        grouped: dict[Cell, set[Cell]] = {}
+        for row in rows:
+            grouped.setdefault((row["outfall_row"], row["outfall_col"]), set()).add(
+                (row["row"], row["col"])
+            )
+        return grouped
+
+    # ------------------------------------------------------------------
+    # Catchment export (one row per outfall that still supplies cells)
+    # ------------------------------------------------------------------
+    def catchment_export(self, grid_id: int) -> list[dict]:
+        """Catchment rows as plain dicts, back-filling legacy grids in place.
+
+        Grids created before the catchment feature have no ``catchments`` rows.
+        They do not need re-importing: the first export generates and stores
+        every catchment inside one write transaction.  A generation or write
+        failure rolls back, leaving flow results and previous catchments
+        untouched.
+        """
+        with self.store.write_tx() as conn:
+            _grid_row(self.store, grid_id)  # 404 before any back-fill work
+            rows = self.store.catchment_rows(grid_id)
+            if not rows:
+                supplied = self._supplied_sets(grid_id)
+                entries = _build_catchment_entries(supplied)
+                self.store.replace_catchments(conn, grid_id, entries, [])
+                rows = self.store.catchment_rows(grid_id)
+        return [
+            {
+                "grid_id": grid_id,
+                "outfall_row": row["outfall_row"],
+                "outfall_col": row["outfall_col"],
+                "cell_count": row["cell_count"],
+                "wkt": row["wkt"],
+            }
+            for row in rows
+        ]
+
+    def catchment_csv(self, grid_id: int) -> str:
+        """Serialize :meth:`catchment_export` to CSV text (CRLF, RFC 4180)."""
+        rows = self.catchment_export(grid_id)
+        buffer = io.StringIO(newline="")
+        writer = csv.writer(buffer, lineterminator="\r\n")
+        writer.writerow(["grid_id", "outfall_row", "outfall_col", "cell_count", "wkt"])
+        for row in rows:
+            writer.writerow(
+                [
+                    row["grid_id"],
+                    row["outfall_row"],
+                    row["outfall_col"],
+                    row["cell_count"],
+                    row["wkt"],
+                ]
+            )
+        return buffer.getvalue()
 
 
 def _counts_json(counts: dict[Cell, int]) -> list[dict]:

@@ -1,2 +1,4 @@
 pytest==9.2.0
 httpx==0.28.1
+# Optional, used only by the geometry validation test (skips when absent).
+shapely==2.2.0

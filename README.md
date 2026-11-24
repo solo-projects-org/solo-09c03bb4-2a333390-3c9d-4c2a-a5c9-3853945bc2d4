@@ -1,8 +1,9 @@
-# 排水流向图：供数、隔离诊断与整批补测
+# 排水流向图：供数、隔离诊断、整批补测与汇水面导出
 
 FastAPI + SQLite 服务。导入一张矩形流向图，回答"哪些格子能顺流到哪个排口"，
 把到不了排口的格子隔离并说明原因（缺测 / 出界 / 环路），再按行列成批补测，
-只重判改动格和原先流经这些格的上游。
+只重判改动格和原先流经这些格的上游；每个仍有供数格的排口还会生成一份恰好
+覆盖其供数格、保留孔洞的 `MULTIPOLYGON` 汇水面，可按图号下载 CSV 叠到施工地块上。
 
 ## 快速开始
 
@@ -78,7 +79,32 @@ SQLite 文件放在 `/data/drainage.sqlite3`（Docker 里由 named volume `drain
 返回 `supply_transition`（每个排口补测前后的供数格数）、`changes`（每格 before/after）
 和 `affected_cells`（这次实际重判了哪些格）。
 
-## Swagger 演示：解开环路
+## 汇水面与 CSV 导出
+
+每个有供数格的排口对应一行汇水面，几何用 OGC WKT 的 `MULTIPOLYGON` 表示，约定：
+
+- 每格是边长 1 的正方形；左上格 `(0,0)` 的左上角为原点 `(0,0)`，`x` 向右、`y` 向上，
+  所以格 `(row, col)` 占 `x ∈ [col, col+1]`、`y ∈ [-row-1, -row]`；
+- 面**恰好**覆盖该排口的供数格：面积（外环减孔洞）恒等于供数格数；
+- 供数格围成的内部空洞保留为内环（顺时针），外环逆时针；
+- 只在角点相接的两片区分成两个多边形（4-连通分组，捏合点再拆成简单环），
+  不会产生自交的"蝴蝶结"环；
+- 排口失去最后一格时，其汇水面行从导出中删除；没有供数格的排口不出现在 CSV 里。
+
+增量规则与补测事务绑定：
+
+1. 一次补测只可能影响"重判格补测前后供数到的排口"，其余排口的汇水面行一字节不动；
+2. 候选排口按**供数格集合**（内容，不是格数）比对：集合哈希变了才重新生成 WKT，
+   格数相同但成员交换也会重做，集合不变就保留旧面；
+3. 集合变空的排口走删除，重新获得供数格时再插回；
+4. 流向、供数结果、汇水面在同一个 `BEGIN IMMEDIATE` 事务里写入，生成 WKT 或写库
+   失败都会整体回滚——补测后仍能查到原来的流向、供数和汇水面。
+
+`catchments` 表持久化汇水面（WKT、格数、供数集合哈希、更新时间）。升级前已导入的
+旧图没有这张表的数据，**不需要重传**：第一次调用导出接口时会在一个写事务里按当前
+供数结果惰性回填并落库；回填失败同样回滚，不影响流向与供数查询。
+
+## Swagger 演示：解开环路并下载汇水面
 
 `POST /grids/demo` 导入内置 5×6 示例：外圈是排口，内部有
 
@@ -108,6 +134,13 @@ SQLite 文件放在 `/data/drainage.sqlite3`（Docker 里由 named volume `drain
 
 缺测格 (3,1) 补测前后都照样挡住 (3,2)，所以补测后隔离的 1 格是它。
 
+在 Swagger UI（`/docs`）里还可以：
+
+1. 补测前 `GET /grids/1/catchments.csv` 下载 CSV：只有排口 (2,5) 一行，覆盖 3 格；
+2. 执行上面的补测后再次下载：变成两行——新排口 (0,2) 的 7 格汇水面出现在
+   `regenerated` 里，排口 (2,5) 的面字节不变；
+3. 不想下文件时用 `GET /grids/1/catchments` 看同样内容的 JSON。
+
 ## API
 
 | 方法 | 路径 | 说明 |
@@ -119,7 +152,15 @@ SQLite 文件放在 `/data/drainage.sqlite3`（Docker 里由 named volume `drain
 | GET | `/grids/{id}` | 按 token 读回整张图 |
 | GET | `/grids/{id}/supply` | 供数结果，按排口分组 |
 | GET | `/grids/{id}/diagnosis` | 隔离诊断 |
-| POST | `/grids/{id}/resurvey` | 整批补测 + 增量重判 |
+| GET | `/grids/{id}/catchments` | 汇水面 JSON（Swagger 里方便查看） |
+| GET | `/grids/{id}/catchments.csv` | 下载汇水面 CSV，每个有供数格的排口一行，含 WKT |
+| POST | `/grids/{id}/resurvey` | 整批补测 + 增量重判 + 汇水面增量重做 |
+
+CSV 表头固定为 `grid_id,outfall_row,outfall_col,cell_count,wkt`，CRLF 行尾、
+RFC 4180 引号（WKT 里有逗号，该字段会被双引号包裹），响应带
+`Content-Disposition: attachment; filename="grid-{id}-catchments.csv"`。
+补测响应额外带 `catchment_transition`：`regenerated` / `unchanged` / `removed`
+三个排口坐标列表，说明这次哪些汇水面被重做、保留或删除。
 
 错误码：`404` 图不存在，`409` 试图补测排口，`422` 非法 token / 非矩形 / 越界 /
 空批次。
@@ -129,21 +170,26 @@ SQLite 文件放在 `/data/drainage.sqlite3`（Docker 里由 named volume `drain
 ```
 app/grid.py     坐标、方向、token 解析、环路规范化
 app/flow.py     单图流向求值（供数 / 三类隔离 / 环路），支持从缓存继承
-app/store.py    SQLite schema、事务、上游递归 CTE
-app/service.py  导入 / 供数 / 诊断 / 整批补测
-app/main.py     FastAPI 路由、错误映射、OpenAPI 示例
-tests/          flow、service、API 三组测试
-scripts/demo.py 端到端演示脚本
+app/polygon.py  供数格集合 -> 带孔洞的 MULTIPOLYGON WKT（4-连通、捏合拆环）
+app/store.py    SQLite schema、事务、上游递归 CTE、汇水面表读写
+app/service.py  导入 / 供数 / 诊断 / 整批补测 / 汇水面导出与惰性回填
+app/main.py     FastAPI 路由、错误映射、OpenAPI 示例、CSV 下载
+tests/          flow、polygon、service、catchment、API 五组测试
+scripts/demo.py 端到端演示脚本（含补测前后 CSV 下载与汇水面变化）
 ```
 
 ## 已验证
 
-- `pytest`：33 个测试全过，覆盖八个方向、三类隔离、环路去重、补测前后供数与诊断、
-  排口不可改、整批校验原子性、模拟写库失败后旧结果仍可查、读快照隔离、写后重开仍在、
-  404/409/422。
-- 随机对拍：5 个种子 × 150 组随机图，导入结果与补测后的缓存结果都等于"从头全量重判"，
-  0 处不一致。
-- 真实 HTTP：起 uvicorn 跑通 `scripts/demo.py`，上面的前后对照表就是实测输出。
+- `pytest`：65 个测试全过，覆盖八个方向、三类隔离、环路去重、补测前后供数与诊断、
+  排口不可改、整批校验原子性、读快照隔离、写后重开仍在、404/409/422，以及汇水面的
+  坐标约定、孔洞、角点分离、捏合拆环、集合变化才重做（含等格数换成员）、失去末格删除、
+  生成/写库失败整体回滚后旧流向供数汇水面仍可查、旧库首次导出惰性回填、CSV 引号与表头。
+- 几何对拍：3000 组随机栅格形状，生成的 WKT 全部通过 shapely `is_valid`，面积等于格数，
+  且 `equals(各格方框的并集)`；测试套件里另有 300 组随机形状的 shapely 校验（无 shapely
+  时自动跳过，运行时不依赖它）。
+- 真实 HTTP：起 uvicorn 跑通 `scripts/demo.py`，实测补测后新增排口 (0,2) 的汇水面被
+  生成、原排口 (2,5) 的面保持不变；并手工验证了角点分离成两个多边形、末格丢失后 CSV
+  只剩表头、旧图删表后首次导出自动回填且二次读取稳定。
 - `EXPLAIN QUERY PLAN` 确认上游递归走的是 `idx_cells_downstream` 索引查找，不是全表扫描。
 
 ## 待办
@@ -155,3 +201,5 @@ scripts/demo.py 端到端演示脚本
   可以改成分批提交。
 - 补测历史落在 `resurveys` / `resurvey_changes` 表里，暂未开放查询接口。
 - 并发写靠 SQLite `BEGIN IMMEDIATE` 串行化，单实例够用；多实例需要换 PostgreSQL。
+- 汇水面 WKT 目前用整数坐标、固定 `MULTIPOLYGON` 文本；若 GIS 侧需要其他坐标系或
+  GeoPackage/Shapefile 导出，需要再加一层投影与序列化。

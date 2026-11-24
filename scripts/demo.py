@@ -3,8 +3,9 @@
 
     python scripts/demo.py [--base http://localhost:8000]
 
-Imports the built-in cycle grid, prints supply and diagnosis, then breaks the
-loop with a one-cell re-survey and prints the before/after numbers.
+Imports the built-in cycle grid, prints supply and diagnosis, downloads the
+catchment CSV, then breaks the loop with a one-cell re-survey and prints the
+before/after numbers together with the regenerated catchment polygons.
 """
 
 from __future__ import annotations
@@ -29,6 +30,15 @@ def call(base: str, method: str, path: str, body: dict | None = None) -> dict:
             return json.load(response)
     except urllib.error.HTTPError as exc:
         sys.exit(f"{method} {path} -> {exc.code}: {exc.read().decode()}")
+
+
+def fetch_text(base: str, path: str) -> str:
+    request = urllib.request.Request(base.rstrip("/") + path, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.read().decode()
+    except urllib.error.HTTPError as exc:
+        sys.exit(f"GET {path} -> {exc.code}: {exc.read().decode()}")
 
 
 def summarize_supply(supply: dict) -> str:
@@ -68,6 +78,24 @@ def summarize_diagnosis(diagnosis: dict) -> str:
     return "\n".join(lines) or "  no isolated cells"
 
 
+def summarize_catchment_csv(csv_text: str) -> str:
+    newline = "\r\n"
+    lines = [line for line in csv_text.replace(newline, "\n").splitlines() if line]
+    if len(lines) == 1:
+        return "  (no outfall currently supplies any cell)"
+    out = []
+    for line in lines[1:]:
+        # WKT contains commas, so the last field is quoted; split the prefix only.
+        prefix, _, wkt = line.partition(",\"")
+        grid_id, outfall_row, outfall_col, cell_count = prefix.split(",")
+        geometry = wkt.rstrip('"')
+        out.append(
+            f"  outfall ({outfall_row},{outfall_col}) covers {cell_count} cell(s):\n"
+            f"    {geometry}"
+        )
+    return "\n".join(out)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="http://localhost:8000")
@@ -85,6 +113,10 @@ def main() -> None:
     print("diagnosis before:")
     print(summarize_diagnosis(diagnosis))
 
+    print("catchments before (GET /grids/{id}/catchments.csv):")
+    csv_before = fetch_text(base, f"/grids/{grid_id}/catchments.csv")
+    print(summarize_catchment_csv(csv_before))
+
     result = call(
         base,
         "POST",
@@ -99,12 +131,21 @@ def main() -> None:
     print("supply transition:")
     print(f"  before: {result['supply_transition']['before']}")
     print(f"  after:  {result['supply_transition']['after']}")
+    print("catchment transition:")
+    for key in ("regenerated", "unchanged", "removed"):
+        cells = result["catchment_transition"][key]
+        rendered = ", ".join(f"({c['row']},{c['col']})" for c in cells) or "none"
+        print(f"  {key}: {rendered}")
 
     supply = call(base, "GET", f"/grids/{grid_id}/supply")
     diagnosis = call(base, "GET", f"/grids/{grid_id}/diagnosis")
     print(f"supply after: {supply['supplied_count']} -> {summarize_supply(supply)}")
     print("diagnosis after:")
     print(summarize_diagnosis(diagnosis))
+
+    print("catchments after:")
+    csv_after = fetch_text(base, f"/grids/{grid_id}/catchments.csv")
+    print(summarize_catchment_csv(csv_after))
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ import random
 import pytest
 
 from app.flow import evaluate_cells
-from app.service import ConflictError, GridService, NotFoundError
+from app.service import ConflictError, NotFoundError
 from app.grid import GridValidationError
 
 DIRECTIONS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]

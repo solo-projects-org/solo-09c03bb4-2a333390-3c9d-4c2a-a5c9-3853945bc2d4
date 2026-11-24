@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from . import __version__
@@ -162,6 +162,33 @@ def create_app(store: Store | None = None) -> FastAPI:
              summary="Isolated cells and why (missing / out of bounds / cycle)")
     def diagnosis(grid_id: int) -> dict:
         return service().diagnosis(grid_id)
+
+    # -- catchments ----------------------------------------------------
+    @app.get(
+        "/grids/{grid_id}/catchments",
+        tags=["catchments"],
+        summary="Catchment of every outfall that still supplies cells (JSON)",
+    )
+    def catchments(grid_id: int) -> dict:
+        rows = service().catchment_export(grid_id)
+        return {"grid_id": grid_id, "count": len(rows), "catchments": rows}
+
+    @app.get(
+        "/grids/{grid_id}/catchments.csv",
+        tags=["catchments"],
+        summary="Download catchments as CSV (one outfall per row, WKT geometry)",
+    )
+    def catchments_csv(grid_id: int) -> Response:
+        text = service().catchment_csv(grid_id)
+        return Response(
+            content=text,
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="grid-{grid_id}-catchments.csv"'
+                )
+            },
+        )
 
     # -- resurvey ------------------------------------------------------
     @app.post("/grids/{grid_id}/resurvey", tags=["resurvey"],

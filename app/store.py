@@ -91,6 +91,19 @@ CREATE TABLE IF NOT EXISTS resurvey_changes (
     after_direction  TEXT,
     PRIMARY KEY (resurvey_id, row, col)
 );
+
+CREATE TABLE IF NOT EXISTS catchments (
+    grid_id       INTEGER NOT NULL REFERENCES grids(id) ON DELETE CASCADE,
+    outfall_row   INTEGER NOT NULL,
+    outfall_col   INTEGER NOT NULL,
+    cell_count    INTEGER NOT NULL CHECK (cell_count > 0),
+    cell_set_hash TEXT NOT NULL,
+    wkt           TEXT NOT NULL,
+    updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (grid_id, outfall_row, outfall_col)
+);
+CREATE INDEX IF NOT EXISTS idx_catchments_grid
+    ON catchments (grid_id, outfall_row, outfall_col);
 """
 
 DB_PATH = Path(os.environ.get("DRAINAGE_DB", "/data/drainage.sqlite3"))
@@ -185,10 +198,12 @@ class Store:
             return {}
         payload = json.dumps([[r, c] for r, c in cells])
         rows = self.conn.execute(
-            "SELECT row, col, kind, direction FROM cells "
-            "WHERE grid_id = ? AND (row, col) IN "
-            "(SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?))",
-            (grid_id, payload),
+            "SELECT c.row, c.col, c.kind, c.direction FROM cells c "
+            "JOIN json_each(?) AS j "
+            "  ON c.row = json_extract(j.value, '$[0]') "
+            " AND c.col = json_extract(j.value, '$[1]') "
+            "WHERE c.grid_id = ?",
+            (payload, grid_id),
         )
         return {(r["row"], r["col"]): (r["kind"], r["direction"]) for r in rows}
 
@@ -330,6 +345,64 @@ class Store:
             ],
         )
         return resurvey_id
+
+    # -- catchments --------------------------------------------------------
+    def catchment_rows(self, grid_id: int) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                "SELECT outfall_row, outfall_col, cell_count, cell_set_hash, wkt, updated_at "
+                "FROM catchments WHERE grid_id = ? ORDER BY outfall_row, outfall_col",
+                (grid_id,),
+            )
+        )
+
+    def catchment_hashes(self, grid_id: int) -> dict[Cell, str]:
+        return {
+            (row["outfall_row"], row["outfall_col"]): row["cell_set_hash"]
+            for row in self.conn.execute(
+                "SELECT outfall_row, outfall_col, cell_set_hash FROM catchments WHERE grid_id = ?",
+                (grid_id,),
+            )
+        }
+
+    def replace_catchments(
+        self,
+        conn: sqlite3.Connection,
+        grid_id: int,
+        entries: Iterable[tuple[Cell, int, str, str]],
+        removed_outfalls: Iterable[Cell],
+    ) -> None:
+        """Upsert generated catchments and delete outfalls that lost all cells.
+
+        ``entries`` holds ``(outfall, cell_count, cell_set_hash, wkt)`` for the
+        outfalls whose supply set changed; ``removed_outfalls`` are the ones
+        whose set became empty.  Runs inside the caller's write transaction.
+        """
+        entries = list(entries)
+        conn.executemany(
+            "INSERT INTO catchments (grid_id, outfall_row, outfall_col, cell_count, cell_set_hash, wkt) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (grid_id, outfall_row, outfall_col) DO UPDATE SET "
+            "cell_count = excluded.cell_count, cell_set_hash = excluded.cell_set_hash, "
+            "wkt = excluded.wkt, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            [
+                (grid_id, outfall[0], outfall[1], cell_count, cell_set_hash, wkt)
+                for outfall, cell_count, cell_set_hash, wkt in entries
+            ],
+        )
+        removed = list(removed_outfalls)
+        if removed:
+            payload = json.dumps([[r, c] for r, c in removed])
+            conn.execute(
+                "DELETE FROM catchments WHERE grid_id = :grid_id AND EXISTS ("
+                "SELECT 1 FROM json_each(:payload) AS j "
+                "WHERE catchments.outfall_row = json_extract(j.value, '$[0]') "
+                "AND catchments.outfall_col = json_extract(j.value, '$[1]'))",
+                {"grid_id": grid_id, "payload": payload},
+            )
+
+    def delete_catchments(self, conn: sqlite3.Connection, grid_id: int) -> None:
+        conn.execute("DELETE FROM catchments WHERE grid_id = ?", (grid_id,))
 
 
 def _result_from_row(row: sqlite3.Row) -> FlowResult:

@@ -1,5 +1,8 @@
 """HTTP contract tests through FastAPI's TestClient."""
 
+import csv
+import io
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -98,3 +101,70 @@ def test_openapi_documents_the_resurvey_shape(client):
     assert "/grids/{grid_id}/resurvey" in spec["paths"]
     assert "/grids/{grid_id}/diagnosis" in spec["paths"]
     assert "/grids/{grid_id}/supply" in spec["paths"]
+
+
+def test_catchment_csv_and_json_endpoints(client):
+    grid_id = client.post(
+        "/grids",
+        json={"tokens": [["E", "E", "O"], ["O", "O", "O"]]},
+    ).json()["grid_id"]
+
+    response = client.get(f"/grids/{grid_id}/catchments.csv")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    assert "attachment" in response.headers["content-disposition"]
+    assert f"grid-{grid_id}-catchments.csv" in response.headers["content-disposition"]
+    lines = response.text.strip().split("\r\n")
+    assert lines[0] == "grid_id,outfall_row,outfall_col,cell_count,wkt"
+    assert len(lines) == 2
+    # The WKT contains commas, so the CSV writer quotes that field (RFC 4180).
+    assert lines[1].startswith(f"{grid_id},0,2,2,\"MULTIPOLYGON")
+    # A standards-aware parser recovers the WKT verbatim.
+    records = list(csv.reader(io.StringIO(response.text)))
+    assert records[0] == ["grid_id", "outfall_row", "outfall_col", "cell_count", "wkt"]
+    assert records[1][4].startswith("MULTIPOLYGON (((0 -1")
+
+    body = client.get(f"/grids/{grid_id}/catchments").json()
+    assert body["count"] == 1
+    row = body["catchments"][0]
+    assert (row["outfall_row"], row["outfall_col"]) == (0, 2)
+    assert row["cell_count"] == 2
+    assert row["wkt"].startswith("MULTIPOLYGON")
+
+
+def test_catchment_csv_reflects_resurvey_and_removal(client):
+    grid_id = client.post(
+        "/grids", json={"tokens": [["E", "O"], ["O", "O"]]}
+    ).json()["grid_id"]
+    before = client.get(f"/grids/{grid_id}/catchments.csv").text
+    assert "MULTIPOLYGON" in before
+
+    # The only supplier leaves the rectangle: its outfall loses its last cell.
+    client.post(
+        f"/grids/{grid_id}/resurvey",
+        json={"updates": [{"row": 0, "col": 0, "value": "N"}]},
+    )
+    after = client.get(f"/grids/{grid_id}/catchments.csv").text
+    assert after.strip().splitlines() == [
+        "grid_id,outfall_row,outfall_col,cell_count,wkt"
+    ]
+
+    # Restore it: the catchment row comes back.
+    client.post(
+        f"/grids/{grid_id}/resurvey",
+        json={"updates": [{"row": 0, "col": 0, "value": "E"}]},
+    )
+    restored = client.get(f"/grids/{grid_id}/catchments").json()
+    assert restored["count"] == 1
+    assert restored["catchments"][0]["cell_count"] == 1
+
+
+def test_catchment_endpoint_404_for_unknown_grid(client):
+    assert client.get("/grids/999/catchments").status_code == 404
+    assert client.get("/grids/999/catchments.csv").status_code == 404
+
+
+def test_openapi_documents_the_catchment_endpoints(client):
+    spec = client.get("/openapi.json").json()
+    assert "/grids/{grid_id}/catchments" in spec["paths"]
+    assert "/grids/{grid_id}/catchments.csv" in spec["paths"]

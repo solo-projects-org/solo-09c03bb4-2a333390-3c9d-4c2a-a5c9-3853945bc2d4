@@ -1,8 +1,5 @@
 """Persistence-level guarantees: reverse-index lookup, snapshots, durability."""
 
-import tempfile
-from pathlib import Path
-
 from app.service import GridService
 from app.store import Store
 
